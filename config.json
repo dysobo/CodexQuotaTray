@@ -1,0 +1,10 @@
+{
+  "BaseUrl": "http://192.168.0.16:8317",
+  "RefreshSeconds": 60,
+  "ShowTaskbarWidget": true,
+  "ManagementKeyEnvironmentVariable": "CPAMC_MANAGEMENT_KEY",
+  "ApiKeyEnvironmentVariable": "",
+  "StatusPaths": [
+    "/"
+  ]
+}

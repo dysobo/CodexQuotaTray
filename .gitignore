@@ -1,0 +1,11 @@
+bin/
+obj/
+*.exe
+*.dll
+*.pdb
+*.user
+*.suo
+usage-state.json
+widget-state.json
+*.log
+.vs/
