@@ -40,10 +40,13 @@ namespace CodexQuotaTray
     internal sealed class TrayAppContext : ApplicationContext
     {
         private const string RunKeyName = "CodexQuotaTray";
+        private const uint EventSystemForeground = 0x0003;
+        private const uint WineventOutOfContext = 0x0000;
         private readonly NotifyIcon _tray;
         private readonly System.Windows.Forms.Timer _timer;
         private readonly System.Windows.Forms.Timer _displayTimer;
         private readonly System.Windows.Forms.Timer _usageTimer;
+        private readonly System.Windows.Forms.Timer _widgetRecoveryTimer;
         private readonly ToolStripMenuItem _startupItem;
         private readonly ToolStripMenuItem _widgetItem;
         private readonly StatusWidget _widget;
@@ -51,10 +54,15 @@ namespace CodexQuotaTray
         private readonly string _configPath;
         private readonly string _usageStatePath;
         private readonly string _widgetStatePath;
+        private readonly object _widgetRecoveryLock = new object();
         private UsageState _usageState;
         private Config _config;
         private bool _refreshing;
         private bool _drainingUsage;
+        private bool _widgetRecoveryScheduled;
+        private DateTime _screenCaptureSeenUntil;
+        private IntPtr _foregroundHook;
+        private WinEventDelegate _foregroundDelegate;
         private int _displayMode;
         private Icon _currentIcon;
         private StatusSnapshot _lastStatus;
@@ -122,8 +130,6 @@ namespace CodexQuotaTray
                 {
                     UpdateTray(_lastStatus);
                 }
-
-                _widget.EnsureVisible(_widgetItem.Checked);
             };
             _displayTimer.Start();
 
@@ -138,6 +144,15 @@ namespace CodexQuotaTray
                 _widget.Show();
             }
 
+            _widgetRecoveryTimer = new System.Windows.Forms.Timer();
+            _widgetRecoveryTimer.Interval = 30000;
+            _widgetRecoveryTimer.Tick += (s, e) => _widget.EnsureVisibleLight(_widgetItem.Checked);
+            _widgetRecoveryTimer.Start();
+
+            InstallForegroundHook();
+            SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+            SystemEvents.UserPreferenceChanged += OnUserPreferenceChanged;
+
             Application.Idle += FirstRefresh;
         }
 
@@ -149,6 +164,15 @@ namespace CodexQuotaTray
             _displayTimer.Dispose();
             _usageTimer.Stop();
             _usageTimer.Dispose();
+            _widgetRecoveryTimer.Stop();
+            _widgetRecoveryTimer.Dispose();
+            SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+            SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
+            if (_foregroundHook != IntPtr.Zero)
+            {
+                UnhookWinEvent(_foregroundHook);
+                _foregroundHook = IntPtr.Zero;
+            }
             _widget.Close();
             _widget.Dispose();
             _tray.Visible = false;
@@ -158,6 +182,143 @@ namespace CodexQuotaTray
                 _currentIcon.Dispose();
             }
             base.ExitThreadCore();
+        }
+
+        private void InstallForegroundHook()
+        {
+            _foregroundDelegate = OnForegroundChanged;
+            _foregroundHook = SetWinEventHook(
+                EventSystemForeground,
+                EventSystemForeground,
+                IntPtr.Zero,
+                _foregroundDelegate,
+                0,
+                0,
+                WineventOutOfContext);
+        }
+
+        private void OnForegroundChanged(
+            IntPtr hook,
+            uint eventType,
+            IntPtr hwnd,
+            int idObject,
+            int idChild,
+            uint eventThread,
+            uint eventTime)
+        {
+            if (hwnd == IntPtr.Zero || idObject != 0 || idChild != 0)
+            {
+                return;
+            }
+
+            var processName = GetForegroundProcessName(hwnd);
+            if (string.IsNullOrWhiteSpace(processName))
+            {
+                return;
+            }
+
+            if (IsScreenCaptureProcess(processName))
+            {
+                _screenCaptureSeenUntil = DateTime.Now.AddSeconds(15);
+                ScheduleWidgetRecovery(700);
+                return;
+            }
+
+            if (IsShellProcess(processName) && DateTime.Now <= _screenCaptureSeenUntil)
+            {
+                ScheduleWidgetRecovery(300);
+            }
+        }
+
+        private void OnDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            ScheduleWidgetRecovery(300);
+        }
+
+        private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
+        {
+            ScheduleWidgetRecovery(300);
+        }
+
+        private void ScheduleWidgetRecovery(int delayMs)
+        {
+            lock (_widgetRecoveryLock)
+            {
+                if (_widgetRecoveryScheduled)
+                {
+                    return;
+                }
+
+                _widgetRecoveryScheduled = true;
+            }
+
+            Task.Delay(Math.Max(0, delayMs)).ContinueWith(t =>
+            {
+                try
+                {
+                    if (_widget == null || _widget.IsDisposed || !_widget.IsHandleCreated)
+                    {
+                        lock (_widgetRecoveryLock)
+                        {
+                            _widgetRecoveryScheduled = false;
+                        }
+                        return;
+                    }
+
+                    _widget.BeginInvoke((MethodInvoker)delegate
+                    {
+                        lock (_widgetRecoveryLock)
+                        {
+                            _widgetRecoveryScheduled = false;
+                        }
+
+                        _widget.EnsureVisible(_widgetItem.Checked);
+                    });
+                }
+                catch
+                {
+                    lock (_widgetRecoveryLock)
+                    {
+                        _widgetRecoveryScheduled = false;
+                    }
+                }
+            });
+        }
+
+        private static string GetForegroundProcessName(IntPtr hwnd)
+        {
+            try
+            {
+                uint processId;
+                GetWindowThreadProcessId(hwnd, out processId);
+                if (processId == 0)
+                {
+                    return null;
+                }
+
+                using (var process = Process.GetProcessById((int)processId))
+                {
+                    return process.ProcessName;
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static bool IsScreenCaptureProcess(string processName)
+        {
+            processName = processName.Trim().ToLowerInvariant();
+            return processName == "snippingtool" ||
+                processName == "screenclippinghost" ||
+                processName == "screensketch";
+        }
+
+        private static bool IsShellProcess(string processName)
+        {
+            processName = processName.Trim().ToLowerInvariant();
+            return processName == "explorer";
         }
 
         private void ReloadConfig()
@@ -359,6 +520,31 @@ namespace CodexQuotaTray
                 return false;
             }
         }
+
+        private delegate void WinEventDelegate(
+            IntPtr hook,
+            uint eventType,
+            IntPtr hwnd,
+            int idObject,
+            int idChild,
+            uint eventThread,
+            uint eventTime);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetWinEventHook(
+            uint eventMin,
+            uint eventMax,
+            IntPtr eventHookAssembly,
+            WinEventDelegate eventProc,
+            uint processId,
+            uint threadId,
+            uint flags);
+
+        [DllImport("user32.dll")]
+        private static extern bool UnhookWinEvent(IntPtr hook);
+
+        [DllImport("user32.dll")]
+        private static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
     }
 
     internal sealed class Config
@@ -2651,6 +2837,16 @@ namespace CodexQuotaTray
 
         public void EnsureVisible(bool shouldBeVisible)
         {
+            EnsureVisibleCore(shouldBeVisible, true);
+        }
+
+        public void EnsureVisibleLight(bool shouldBeVisible)
+        {
+            EnsureVisibleCore(shouldBeVisible, false);
+        }
+
+        private void EnsureVisibleCore(bool shouldBeVisible, bool reassertTopMost)
+        {
             if (!shouldBeVisible || IsDisposed)
             {
                 return;
@@ -2668,19 +2864,22 @@ namespace CodexQuotaTray
             }
 
             KeepTransparentBackground();
-            TopMost = false;
-            TopMost = true;
-            ShowWindow(Handle, 4);
-            SetWindowPos(
-                Handle,
-                new IntPtr(-1),
-                0,
-                0,
-                0,
-                0,
-                0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200);
-            Invalidate(true);
-            Update();
+            if (reassertTopMost)
+            {
+                TopMost = false;
+                TopMost = true;
+                ShowWindow(Handle, 4);
+                SetWindowPos(
+                    Handle,
+                    new IntPtr(-1),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200);
+                Invalidate(true);
+                Update();
+            }
         }
 
         protected override void OnShown(EventArgs e)
