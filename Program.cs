@@ -844,6 +844,7 @@ namespace CodexQuotaTray
                         quotas.Add(new CodexQuotaResult
                         {
                             Name = file.Name,
+                            PlanType = file.PlanType,
                             Error = CleanMessage(ex.Message)
                         });
                     }
@@ -874,7 +875,6 @@ namespace CodexQuotaTray
                 CallFailed = usage.Failed
             };
 
-            var maxPercent = new int?();
             var quotaLines = new List<string>();
             foreach (var quota in quotas)
             {
@@ -884,37 +884,12 @@ namespace CodexQuotaTray
                     continue;
                 }
 
-                foreach (var window in quota.Windows)
-                {
-                    var percent = window.UsedPercent.HasValue ? window.UsedPercent.Value + "%" : "--";
-                    quotaLines.Add(ShortName(quota.Name) + " " + window.Label + " " + percent + " " + window.ResetLabel);
-                    if (window.UsedPercent.HasValue)
-                    {
-                        var remaining = 100 - window.UsedPercent.Value;
-                        if (window.WindowKey == "5h")
-                        {
-                            if (!snapshot.Quota5hRemaining.HasValue || remaining < snapshot.Quota5hRemaining.Value)
-                            {
-                                snapshot.Quota5hRemaining = remaining;
-                                snapshot.Quota5hReset = window.ResetLabel;
-                            }
-                        }
-                        else if (window.WindowKey == "7d")
-                        {
-                            if (!snapshot.Quota7dRemaining.HasValue || remaining < snapshot.Quota7dRemaining.Value)
-                            {
-                                snapshot.Quota7dRemaining = remaining;
-                                snapshot.Quota7dReset = window.ResetLabel;
-                            }
-                        }
-
-                        if (!maxPercent.HasValue || window.UsedPercent.Value > maxPercent.Value)
-                        {
-                            maxPercent = window.UsedPercent.Value;
-                        }
-                    }
-                }
+                quotaLines.Add(BuildQuotaAccountLine(quota));
             }
+
+            var fiveHourPool = BuildQuotaPool(quotas, "5h");
+            var weekPool = BuildQuotaPool(quotas, "7d");
+            ApplyQuotaPool(snapshot, fiveHourPool, weekPool);
 
             var messageParts = new List<string>();
             if (hasUsage)
@@ -924,13 +899,20 @@ namespace CodexQuotaTray
 
             messageParts.Add("Codex files " + codexFileCount);
 
-            if (maxPercent.HasValue)
+            if (fiveHourPool.HasData || weekPool.HasData)
             {
-                var value = Math.Max(0, Math.Min(100, maxPercent.Value));
-                snapshot.Used = value;
-                snapshot.Limit = 100;
-                snapshot.Remaining = 100 - value;
-                messageParts.Add("Max quota used " + value + "%");
+                var pools = new List<string>();
+                if (fiveHourPool.HasData)
+                {
+                    pools.Add("5h " + FormatPoolSummary(fiveHourPool));
+                }
+
+                if (weekPool.HasData)
+                {
+                    pools.Add("7d " + FormatPoolSummary(weekPool));
+                }
+
+                messageParts.Add("Pool " + string.Join(", ", pools.ToArray()));
             }
             else if (hasUsage && usage.Total > 0)
             {
@@ -958,6 +940,194 @@ namespace CodexQuotaTray
             }
 
             return snapshot;
+        }
+
+        private static void ApplyQuotaPool(StatusSnapshot snapshot, QuotaPoolAggregate fiveHourPool, QuotaPoolAggregate weekPool)
+        {
+            var lowestRemaining = new int?();
+
+            if (fiveHourPool.HasData)
+            {
+                snapshot.Quota5hRemaining = fiveHourPool.RemainingPercent;
+                snapshot.Quota5hReset = fiveHourPool.ResetLabel;
+                snapshot.Quota5hAccountCount = fiveHourPool.AccountCount;
+                lowestRemaining = LowerRemaining(lowestRemaining, fiveHourPool.RemainingPercent);
+            }
+
+            if (weekPool.HasData)
+            {
+                snapshot.Quota7dRemaining = weekPool.RemainingPercent;
+                snapshot.Quota7dReset = weekPool.ResetLabel;
+                snapshot.Quota7dAccountCount = weekPool.AccountCount;
+                lowestRemaining = LowerRemaining(lowestRemaining, weekPool.RemainingPercent);
+            }
+
+            if (lowestRemaining.HasValue)
+            {
+                snapshot.Remaining = lowestRemaining.Value;
+                snapshot.Limit = 100;
+                snapshot.Used = 100 - lowestRemaining.Value;
+            }
+        }
+
+        private static int? LowerRemaining(int? current, int? candidate)
+        {
+            if (!candidate.HasValue)
+            {
+                return current;
+            }
+
+            if (!current.HasValue || candidate.Value < current.Value)
+            {
+                return candidate.Value;
+            }
+
+            return current;
+        }
+
+        private static QuotaPoolAggregate BuildQuotaPool(List<CodexQuotaResult> quotas, string windowKey)
+        {
+            var pool = new QuotaPoolAggregate(windowKey);
+            foreach (var quota in quotas)
+            {
+                if (!string.IsNullOrWhiteSpace(quota.Error))
+                {
+                    continue;
+                }
+
+                var window = SelectPoolWindow(quota, windowKey);
+                if (window != null)
+                {
+                    pool.Add(window);
+                }
+            }
+
+            return pool;
+        }
+
+        private static CodexQuotaWindow SelectPoolWindow(CodexQuotaResult quota, string windowKey)
+        {
+            var useCodeOnly = false;
+            foreach (var window in quota.Windows)
+            {
+                if (string.Equals(window.Category, "Code", StringComparison.OrdinalIgnoreCase))
+                {
+                    useCodeOnly = true;
+                    break;
+                }
+            }
+
+            CodexQuotaWindow selected = null;
+            foreach (var window in quota.Windows)
+            {
+                if (!string.Equals(window.WindowKey, windowKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (useCodeOnly && !string.Equals(window.Category, "Code", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                if (selected == null || CompareQuotaWindow(window, selected) < 0)
+                {
+                    selected = window;
+                }
+            }
+
+            return selected;
+        }
+
+        private static int CompareQuotaWindow(CodexQuotaWindow left, CodexQuotaWindow right)
+        {
+            var leftRemaining = GetWindowRemainingPercent(left);
+            var rightRemaining = GetWindowRemainingPercent(right);
+            if (leftRemaining.HasValue && rightRemaining.HasValue)
+            {
+                return leftRemaining.Value.CompareTo(rightRemaining.Value);
+            }
+
+            if (leftRemaining.HasValue)
+            {
+                return -1;
+            }
+
+            if (rightRemaining.HasValue)
+            {
+                return 1;
+            }
+
+            return string.Compare(left.Label, right.Label, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string BuildQuotaAccountLine(CodexQuotaResult quota)
+        {
+            var plan = string.IsNullOrWhiteSpace(quota.PlanType) ? "" : " " + quota.PlanType;
+            var fiveHour = SelectPoolWindow(quota, "5h");
+            var week = SelectPoolWindow(quota, "7d");
+            return ShortName(quota.Name) + plan +
+                " 5h " + FormatWindowRemaining(fiveHour) +
+                " 7d " + FormatWindowRemaining(week);
+        }
+
+        private static string FormatWindowRemaining(CodexQuotaWindow window)
+        {
+            if (window == null)
+            {
+                return "--";
+            }
+
+            var remaining = GetWindowRemainingPercent(window);
+            return remaining.HasValue ? remaining.Value + "%" : "--";
+        }
+
+        private static string FormatPoolSummary(QuotaPoolAggregate pool)
+        {
+            var value = pool.RemainingPercent.HasValue ? pool.RemainingPercent.Value + "%" : "--";
+            return value + " x" + pool.AccountCount;
+        }
+
+        private static int? GetWindowRemainingPercent(CodexQuotaWindow window)
+        {
+            if (window == null)
+            {
+                return null;
+            }
+
+            if (window.Limit.HasValue && window.Limit.Value > 0)
+            {
+                long remaining;
+                if (window.Remaining.HasValue)
+                {
+                    remaining = window.Remaining.Value;
+                }
+                else if (window.Used.HasValue)
+                {
+                    remaining = window.Limit.Value - window.Used.Value;
+                }
+                else
+                {
+                    remaining = -1;
+                }
+
+                if (remaining >= 0)
+                {
+                    return ClampPercent((int)Math.Round(remaining * 100.0 / window.Limit.Value));
+                }
+            }
+
+            if (window.UsedPercent.HasValue)
+            {
+                return ClampPercent(100 - window.UsedPercent.Value);
+            }
+
+            return null;
+        }
+
+        private static int ClampPercent(int value)
+        {
+            return Math.Max(0, Math.Min(100, value));
         }
 
         private static async Task<UsageTotals> FetchUsageTotalsAsync(Config config, string managementKey)
@@ -1179,7 +1349,22 @@ namespace CodexQuotaTray
                 return;
             }
 
+            var used = ToLong(GetValue(window, "used", "used_count", "usedCount", "used_requests", "usedRequests", "usage", "current"));
+            var limit = ToLong(GetValue(window, "limit", "quota", "max", "cap", "hard_limit", "hardLimit", "total"));
+            var remaining = ToLong(GetValue(window, "remaining", "remain", "left", "available"));
             var percent = ToInt(GetValue(window, "used_percent", "usedPercent"));
+            if (!percent.HasValue && limit.HasValue && limit.Value > 0)
+            {
+                if (used.HasValue)
+                {
+                    percent = ClampPercent((int)Math.Round(used.Value * 100.0 / limit.Value));
+                }
+                else if (remaining.HasValue)
+                {
+                    percent = ClampPercent(100 - (int)Math.Round(remaining.Value * 100.0 / limit.Value));
+                }
+            }
+
             if (!percent.HasValue && (limitReached || allowed == false))
             {
                 percent = 100;
@@ -1187,7 +1372,7 @@ namespace CodexQuotaTray
 
             if (percent.HasValue)
             {
-                percent = Math.Max(0, Math.Min(100, percent.Value));
+                percent = ClampPercent(percent.Value);
             }
 
             var seconds = ToInt(GetValue(window, "limit_window_seconds", "limitWindowSeconds"));
@@ -1195,9 +1380,13 @@ namespace CodexQuotaTray
             var label = prefix + " " + windowKey;
             result.Windows.Add(new CodexQuotaWindow
             {
+                Category = prefix,
                 Label = label,
                 WindowKey = windowKey,
                 UsedPercent = percent,
+                Used = used,
+                Limit = limit,
+                Remaining = remaining,
                 ResetLabel = FormatReset(window)
             });
         }
@@ -1660,6 +1849,93 @@ namespace CodexQuotaTray
             return value.Length > 180 ? value.Substring(0, 180) : value;
         }
 
+        private sealed class QuotaPoolAggregate
+        {
+            private readonly List<int> _remainingPercents;
+            private long _weightedLimit;
+            private long _weightedRemaining;
+            private int _weightedSamples;
+
+            public QuotaPoolAggregate(string windowKey)
+            {
+                WindowKey = windowKey;
+                _remainingPercents = new List<int>();
+            }
+
+            public string WindowKey { get; private set; }
+            public int AccountCount { get; private set; }
+            public string ResetLabel { get; private set; }
+
+            public bool HasData
+            {
+                get { return AccountCount > 0 && RemainingPercent.HasValue; }
+            }
+
+            public int? RemainingPercent
+            {
+                get
+                {
+                    if (_weightedLimit > 0 && _weightedSamples == AccountCount)
+                    {
+                        return ClampPercent((int)Math.Round(_weightedRemaining * 100.0 / _weightedLimit));
+                    }
+
+                    if (_remainingPercents.Count == 0)
+                    {
+                        return null;
+                    }
+
+                    var total = 0;
+                    foreach (var value in _remainingPercents)
+                    {
+                        total += value;
+                    }
+
+                    return ClampPercent((int)Math.Round(total / (double)_remainingPercents.Count));
+                }
+            }
+
+            public void Add(CodexQuotaWindow window)
+            {
+                var remainingPercent = GetWindowRemainingPercent(window);
+                if (!remainingPercent.HasValue)
+                {
+                    return;
+                }
+
+                AccountCount++;
+                _remainingPercents.Add(remainingPercent.Value);
+                if (string.IsNullOrWhiteSpace(ResetLabel))
+                {
+                    ResetLabel = window.ResetLabel;
+                }
+
+                if (window.Limit.HasValue && window.Limit.Value > 0)
+                {
+                    long remaining;
+                    if (window.Remaining.HasValue)
+                    {
+                        remaining = window.Remaining.Value;
+                    }
+                    else if (window.Used.HasValue)
+                    {
+                        remaining = window.Limit.Value - window.Used.Value;
+                    }
+                    else
+                    {
+                        remaining = -1;
+                    }
+
+                    if (remaining >= 0)
+                    {
+                        _weightedLimit += window.Limit.Value;
+                        _weightedRemaining += Math.Max(0, Math.Min(window.Limit.Value, remaining));
+                        _weightedSamples++;
+                    }
+                }
+            }
+        }
+
         private sealed class UsageTotals
         {
             public long Success { get; set; }
@@ -1693,9 +1969,13 @@ namespace CodexQuotaTray
 
         private sealed class CodexQuotaWindow
         {
+            public string Category { get; set; }
             public string Label { get; set; }
             public string WindowKey { get; set; }
             public int? UsedPercent { get; set; }
+            public long? Used { get; set; }
+            public long? Limit { get; set; }
+            public long? Remaining { get; set; }
             public string ResetLabel { get; set; }
         }
     }
@@ -1903,6 +2183,8 @@ namespace CodexQuotaTray
         public long? TokenReasoning { get; set; }
         public int? Quota5hRemaining { get; set; }
         public int? Quota7dRemaining { get; set; }
+        public int? Quota5hAccountCount { get; set; }
+        public int? Quota7dAccountCount { get; set; }
         public string Quota5hReset { get; set; }
         public string Quota7dReset { get; set; }
         public string Message { get; set; }
@@ -1995,7 +2277,7 @@ namespace CodexQuotaTray
                 return "CPA ERR";
             }
 
-            return GetCallsText() + " | 5h " + FormatPercent(Quota5hRemaining) + " | 7d " + FormatPercent(Quota7dRemaining);
+            return GetCallsText() + " | 5h " + GetQuota5hText() + " | 7d " + GetQuota7dText();
         }
 
         public string GetCallsText()
@@ -2017,6 +2299,32 @@ namespace CodexQuotaTray
         public static string FormatPercent(int? value)
         {
             return value.HasValue ? value.Value + "%" : "--";
+        }
+
+        public string GetQuota5hText()
+        {
+            return FormatQuotaPool(Quota5hRemaining, Quota5hAccountCount);
+        }
+
+        public string GetQuota7dText()
+        {
+            return FormatQuotaPool(Quota7dRemaining, Quota7dAccountCount);
+        }
+
+        private static string FormatQuotaPool(int? remaining, int? accountCount)
+        {
+            if (!remaining.HasValue)
+            {
+                return "--";
+            }
+
+            var text = remaining.Value + "%";
+            if (accountCount.HasValue && accountCount.Value > 0)
+            {
+                text += " x" + accountCount.Value;
+            }
+
+            return text;
         }
 
         public long? CallTotal
@@ -2081,6 +2389,22 @@ namespace CodexQuotaTray
 
         private string GetQuotaLine()
         {
+            if (Quota5hRemaining.HasValue || Quota7dRemaining.HasValue)
+            {
+                var poolParts = new List<string>();
+                if (Quota5hRemaining.HasValue)
+                {
+                    poolParts.Add("5h " + GetQuota5hText());
+                }
+
+                if (Quota7dRemaining.HasValue)
+                {
+                    poolParts.Add("7d " + GetQuota7dText());
+                }
+
+                return "Quota pool " + string.Join(", ", poolParts.ToArray());
+            }
+
             if (Used.HasValue && Limit.HasValue && Limit.Value == 100 && Remaining.HasValue)
             {
                 return "Quota used " + Used.Value + "%, remaining " + Remaining.Value + "%";
@@ -2230,8 +2554,8 @@ namespace CodexQuotaTray
             {
                 _callsLabel.Text = status.GetCompactCallsText();
                 _callsLabel.ForeColor = Color.White;
-                SetBar(_fiveHourTrack, _fiveHourFill, _fiveHourPercentLabel, status.Quota5hRemaining);
-                SetBar(_weekTrack, _weekFill, _weekPercentLabel, status.Quota7dRemaining);
+                SetBar(_fiveHourTrack, _fiveHourFill, _fiveHourPercentLabel, status.Quota5hRemaining, status.GetQuota5hText());
+                SetBar(_weekTrack, _weekFill, _weekPercentLabel, status.Quota7dRemaining, status.GetQuota7dText());
                 KeepTransparentBackground();
             }
         }
@@ -2338,7 +2662,7 @@ namespace CodexQuotaTray
             {
                 Left = 30,
                 Top = top,
-                Width = 158,
+                Width = 146,
                 Height = 6,
                 BackColor = Color.FromArgb(70, 80, 76),
                 ContextMenuStrip = menu
@@ -2357,9 +2681,9 @@ namespace CodexQuotaTray
 
             percentLabel = new Label
             {
-                Left = 192,
+                Left = 180,
                 Top = top - 6,
-                Width = 37,
+                Width = 49,
                 Height = 16,
                 Text = "--",
                 TextAlign = ContentAlignment.MiddleRight,
@@ -2376,6 +2700,11 @@ namespace CodexQuotaTray
 
         private static void SetBar(Panel track, Panel fill, Label percentLabel, int? remaining)
         {
+            SetBar(track, fill, percentLabel, remaining, null);
+        }
+
+        private static void SetBar(Panel track, Panel fill, Label percentLabel, int? remaining, string labelText)
+        {
             if (!remaining.HasValue)
             {
                 fill.Width = 0;
@@ -2387,7 +2716,7 @@ namespace CodexQuotaTray
             var value = Math.Max(0, Math.Min(100, remaining.Value));
             fill.Width = (int)Math.Round(track.Width * value / 100.0);
             fill.BackColor = BarColor(value);
-            percentLabel.Text = value + "%";
+            percentLabel.Text = string.IsNullOrWhiteSpace(labelText) ? value + "%" : labelText;
         }
 
         private static Color BarColor(int remaining)
