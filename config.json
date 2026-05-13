@@ -1,10 +1,27 @@
 {
+  "_comment": "CodexQuotaTray 配置。JSON 不支持真正注释，所以 _ 开头字段只是备注，程序会忽略。",
+  "_security": "不要把 CPA 管理密钥、API Key 或 OAuth Token 写在这里。管理密钥请放到 Windows 用户环境变量。",
+
   "BaseUrl": "http://192.168.0.16:8317",
+  "_BaseUrl": "CPA / CPAMC 基础地址，只写协议、主机和端口。",
+  "ManagementPath": "/management.html",
+  "_ManagementPath": "右键菜单“打开 CPA”会跳转到 BaseUrl + ManagementPath。",
+  "ProviderMode": "cpamc",
+  "_ProviderMode": "当前已测试 cpamc。newapi/sub2api 是后续兼容目标，目前仅作为 generic StatusPaths 预留，尚未测试。",
+
   "RefreshSeconds": 60,
   "ShowTaskbarWidget": true,
   "ManagementKeyEnvironmentVariable": "CPAMC_MANAGEMENT_KEY",
   "ApiKeyEnvironmentVariable": "",
+
   "StatusPaths": [
     "/"
+  ],
+  "_StatusPaths": "非 CPAMC 服务的通用状态接口兜底。CPAMC 的 calls/tokens/quota 仍走 /v0/management/*。",
+
+  "CompatibilityNotes": [
+    "cpamc: 已按 /v0/management/* 测试。",
+    "newapi: 计划兼容，尚未测试。",
+    "sub2api: 计划兼容，尚未测试。"
   ]
 }

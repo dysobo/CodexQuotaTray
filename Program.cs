@@ -79,7 +79,7 @@ namespace CodexQuotaTray
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("立即刷新", null, async (s, e) => await RefreshStatusAsync(true));
-            menu.Items.Add("打开接口", null, (s, e) => OpenExternal(_config.BaseUrl));
+            menu.Items.Add("打开 CPA", null, (s, e) => OpenExternal(_config.ManagementUrl));
             menu.Items.Add("打开配置", null, (s, e) => OpenExternal(_configPath));
             menu.Items.Add("重新加载配置", null, (s, e) => ReloadConfig());
             menu.Items.Add(new ToolStripSeparator());
@@ -122,6 +122,8 @@ namespace CodexQuotaTray
                 {
                     UpdateTray(_lastStatus);
                 }
+
+                _widget.EnsureVisible(_widgetItem.Checked);
             };
             _displayTimer.Start();
 
@@ -362,11 +364,29 @@ namespace CodexQuotaTray
     internal sealed class Config
     {
         public string BaseUrl { get; set; }
+        public string ManagementPath { get; set; }
+        public string ProviderMode { get; set; }
         public int RefreshSeconds { get; set; }
         public bool ShowTaskbarWidget { get; set; }
         public string ManagementKeyEnvironmentVariable { get; set; }
         public string ApiKeyEnvironmentVariable { get; set; }
         public string[] StatusPaths { get; set; }
+        public string[] CompatibilityNotes { get; set; }
+
+        public string ManagementUrl
+        {
+            get
+            {
+                var path = string.IsNullOrWhiteSpace(ManagementPath) ? "/management.html" : ManagementPath.Trim();
+                if (path.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+                    path.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                {
+                    return path;
+                }
+
+                return BaseUrl.TrimEnd('/') + "/" + path.TrimStart('/');
+            }
+        }
 
         public static Config Load(string path)
         {
@@ -399,6 +419,17 @@ namespace CodexQuotaTray
             }
 
             BaseUrl = BaseUrl.Trim().TrimEnd('/');
+            if (string.IsNullOrWhiteSpace(ManagementPath))
+            {
+                ManagementPath = "/management.html";
+            }
+
+            if (string.IsNullOrWhiteSpace(ProviderMode))
+            {
+                ProviderMode = "cpamc";
+            }
+
+            ProviderMode = ProviderMode.Trim().ToLowerInvariant();
             if (RefreshSeconds < 5)
             {
                 RefreshSeconds = 60;
@@ -420,6 +451,8 @@ namespace CodexQuotaTray
             return new Config
             {
                 BaseUrl = "http://192.168.0.16:8317",
+                ManagementPath = "/management.html",
+                ProviderMode = "cpamc",
                 RefreshSeconds = 60,
                 ShowTaskbarWidget = true,
                 ManagementKeyEnvironmentVariable = "CPAMC_MANAGEMENT_KEY",
@@ -427,6 +460,11 @@ namespace CodexQuotaTray
                 StatusPaths = new[]
                 {
                     "/"
+                },
+                CompatibilityNotes = new[]
+                {
+                    "cpamc is tested.",
+                    "newapi and sub2api are planned compatibility targets, not tested yet."
                 }
             };
         }
@@ -434,13 +472,30 @@ namespace CodexQuotaTray
         private static string DefaultJson()
         {
             return "{\r\n" +
+                "  \"_comment\": \"CodexQuotaTray configuration. JSON does not allow comments, so fields starting with _ are notes and are ignored by the app.\",\r\n" +
+                "  \"_security\": \"Do not put CPAMC keys or API keys here. Store the management key in the Windows user environment variable below.\",\r\n" +
+                "\r\n" +
                 "  \"BaseUrl\": \"http://192.168.0.16:8317\",\r\n" +
+                "  \"_BaseUrl\": \"CPA / CPAMC base URL. Keep host and port here only.\",\r\n" +
+                "  \"ManagementPath\": \"/management.html\",\r\n" +
+                "  \"_ManagementPath\": \"Right-click menu 'Open CPA' opens BaseUrl + ManagementPath.\",\r\n" +
+                "  \"ProviderMode\": \"cpamc\",\r\n" +
+                "  \"_ProviderMode\": \"cpamc is tested. newapi/sub2api are reserved for later testing and currently use generic StatusPaths only.\",\r\n" +
+                "\r\n" +
                 "  \"RefreshSeconds\": 60,\r\n" +
                 "  \"ShowTaskbarWidget\": true,\r\n" +
                 "  \"ManagementKeyEnvironmentVariable\": \"CPAMC_MANAGEMENT_KEY\",\r\n" +
                 "  \"ApiKeyEnvironmentVariable\": \"\",\r\n" +
+                "\r\n" +
                 "  \"StatusPaths\": [\r\n" +
                 "    \"/\"\r\n" +
+                "  ],\r\n" +
+                "  \"_StatusPaths\": \"Fallback generic status endpoints for non-CPAMC providers. CPAMC quota aggregation uses management APIs.\",\r\n" +
+                "\r\n" +
+                "  \"CompatibilityNotes\": [\r\n" +
+                "    \"cpamc: tested with /v0/management/* APIs.\",\r\n" +
+                "    \"newapi: planned, not tested yet.\",\r\n" +
+                "    \"sub2api: planned, not tested yet.\"\r\n" +
                 "  ]\r\n" +
                 "}\r\n";
         }
@@ -450,10 +505,14 @@ namespace CodexQuotaTray
     {
         public static async Task<StatusSnapshot> FetchAsync(Config config)
         {
-            var cpamcStatus = await CpamcClient.TryFetchAsync(config);
-            if (cpamcStatus != null)
+            if (string.Equals(config.ProviderMode, "cpamc", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(config.ProviderMode, "auto", StringComparison.OrdinalIgnoreCase))
             {
-                return cpamcStatus;
+                var cpamcStatus = await CpamcClient.TryFetchAsync(config);
+                if (cpamcStatus != null)
+                {
+                    return cpamcStatus;
+                }
             }
 
             var apiKey = GetApiKey(config.ApiKeyEnvironmentVariable);
@@ -709,6 +768,12 @@ namespace CodexQuotaTray
 
         public static async Task<TokenUsageDelta> DrainUsageQueueAsync(Config config, int count)
         {
+            if (!string.Equals(config.ProviderMode, "cpamc", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(config.ProviderMode, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                return new TokenUsageDelta();
+            }
+
             if (string.IsNullOrWhiteSpace(config.ManagementKeyEnvironmentVariable))
             {
                 return new TokenUsageDelta();
@@ -772,6 +837,12 @@ namespace CodexQuotaTray
 
         public static async Task<StatusSnapshot> TryFetchAsync(Config config)
         {
+            if (!string.Equals(config.ProviderMode, "cpamc", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(config.ProviderMode, "auto", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
             if (string.IsNullOrWhiteSpace(config.ManagementKeyEnvironmentVariable))
             {
                 return null;
@@ -2569,11 +2640,47 @@ namespace CodexQuotaTray
                     ApplyInitialPosition();
                     Show();
                 }
+
+                EnsureVisible(true);
             }
             else
             {
                 Hide();
             }
+        }
+
+        public void EnsureVisible(bool shouldBeVisible)
+        {
+            if (!shouldBeVisible || IsDisposed)
+            {
+                return;
+            }
+
+            if (!Visible)
+            {
+                ApplyInitialPosition();
+                Show();
+            }
+
+            if (WindowState == FormWindowState.Minimized)
+            {
+                WindowState = FormWindowState.Normal;
+            }
+
+            KeepTransparentBackground();
+            TopMost = false;
+            TopMost = true;
+            ShowWindow(Handle, 4);
+            SetWindowPos(
+                Handle,
+                new IntPtr(-1),
+                0,
+                0,
+                0,
+                0,
+                0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200);
+            Invalidate(true);
+            Update();
         }
 
         protected override void OnShown(EventArgs e)
@@ -2582,6 +2689,23 @@ namespace CodexQuotaTray
             if (!_positionApplied)
             {
                 ApplyInitialPosition();
+            }
+
+            EnsureVisible(true);
+        }
+
+        protected override bool ShowWithoutActivation
+        {
+            get { return true; }
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.ExStyle |= 0x08000000;
+                return cp;
             }
         }
 
@@ -2806,6 +2930,19 @@ namespace CodexQuotaTray
 
         [DllImport("user32.dll")]
         private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetWindowPos(
+            IntPtr hWnd,
+            IntPtr hWndInsertAfter,
+            int x,
+            int y,
+            int cx,
+            int cy,
+            uint flags);
     }
 
     internal static class IconPainter
