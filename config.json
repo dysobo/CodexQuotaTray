@@ -10,6 +10,11 @@
   "_ProviderMode": "当前已测试 cpamc。newapi/sub2api 是后续兼容目标，目前仅作为 generic StatusPaths 预留，尚未测试。",
 
   "RefreshSeconds": 60,
+  "_RefreshSeconds": "Calls 活跃刷新间隔。调用次数有变化时，按这个间隔继续检查。",
+  "CallsIdleRefreshSeconds": 600,
+  "_CallsIdleRefreshSeconds": "如果 Calls 总数没有变化，下一次 Calls 检查延长到这个间隔。",
+  "QuotaRefreshSeconds": 180,
+  "_QuotaRefreshSeconds": "Codex 账号 5h/7d 额度刷新间隔。只有这个间隔到期才请求 wham/usage。",
   "ShowTaskbarWidget": true,
   "ManagementKeyEnvironmentVariable": "CPAMC_MANAGEMENT_KEY",
   "ApiKeyEnvironmentVariable": "",

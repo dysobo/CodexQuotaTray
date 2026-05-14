@@ -60,6 +60,9 @@ namespace CodexQuotaTray
         private bool _refreshing;
         private bool _drainingUsage;
         private bool _widgetRecoveryScheduled;
+        private DateTime _nextCallsRefresh;
+        private DateTime _nextQuotaRefresh;
+        private long? _lastObservedCallTotal;
         private DateTime _screenCaptureSeenUntil;
         private IntPtr _foregroundHook;
         private WinEventDelegate _foregroundDelegate;
@@ -86,7 +89,7 @@ namespace CodexQuotaTray
             };
 
             var menu = new ContextMenuStrip();
-            menu.Items.Add("立即刷新", null, async (s, e) => await RefreshStatusAsync(true));
+            menu.Items.Add("立即刷新", null, async (s, e) => await RefreshStatusAsync(true, true));
             menu.Items.Add("打开 CPA", null, (s, e) => OpenExternal(_config.ManagementUrl));
             menu.Items.Add("打开配置", null, (s, e) => OpenExternal(_configPath));
             menu.Items.Add("重新加载配置", null, (s, e) => ReloadConfig());
@@ -112,13 +115,13 @@ namespace CodexQuotaTray
                 }
                 else if (e.Button == MouseButtons.Middle)
                 {
-                    await RefreshStatusAsync(true);
+                    await RefreshStatusAsync(true, true);
                 }
             };
 
             _timer = new System.Windows.Forms.Timer();
-            _timer.Interval = Math.Max(5, _config.RefreshSeconds) * 1000;
-            _timer.Tick += async (s, e) => await RefreshStatusAsync(false);
+            _timer.Interval = 5000;
+            _timer.Tick += async (s, e) => await RefreshDueStatusAsync();
             _timer.Start();
 
             _displayTimer = new System.Windows.Forms.Timer();
@@ -324,10 +327,12 @@ namespace CodexQuotaTray
         private void ReloadConfig()
         {
             _config = Config.Load(_configPath);
-            _timer.Interval = Math.Max(5, _config.RefreshSeconds) * 1000;
+            _timer.Interval = 5000;
+            _nextCallsRefresh = DateTime.MinValue;
+            _nextQuotaRefresh = DateTime.MinValue;
             _widgetItem.Checked = _config.ShowTaskbarWidget;
             _widget.SetVisible(_config.ShowTaskbarWidget);
-            _ = RefreshStatusAsync(true);
+            _ = RefreshStatusAsync(true, true);
         }
 
         private void ToggleWidget(object sender, EventArgs e)
@@ -339,10 +344,28 @@ namespace CodexQuotaTray
         private void FirstRefresh(object sender, EventArgs e)
         {
             Application.Idle -= FirstRefresh;
-            _ = RefreshStatusAsync(false);
+            _ = RefreshStatusAsync(false, true);
         }
 
-        private async Task RefreshStatusAsync(bool showBalloon)
+        private async Task RefreshDueStatusAsync()
+        {
+            var now = DateTime.Now;
+            var callsDue = now >= _nextCallsRefresh;
+            var quotaDue = now >= _nextQuotaRefresh;
+            if (!callsDue && !quotaDue)
+            {
+                return;
+            }
+
+            await RefreshStatusAsync(false, callsDue, quotaDue);
+        }
+
+        private async Task RefreshStatusAsync(bool showBalloon, bool includeQuota)
+        {
+            await RefreshStatusAsync(showBalloon, true, includeQuota);
+        }
+
+        private async Task RefreshStatusAsync(bool showBalloon, bool includeCalls, bool includeQuota)
         {
             if (_refreshing)
             {
@@ -352,8 +375,19 @@ namespace CodexQuotaTray
             _refreshing = true;
             try
             {
-                var status = await StatusClient.FetchAsync(_config);
+                var status = await StatusClient.FetchAsync(_config, includeCalls, includeQuota);
+                if (!includeCalls)
+                {
+                    PreserveCallData(status, _lastStatus);
+                }
+
+                if (!includeQuota)
+                {
+                    PreserveQuotaData(status, _lastStatus);
+                }
+
                 ApplyUsageState(status);
+                ScheduleNextStatusRefresh(status, includeCalls, includeQuota);
                 _lastStatus = status;
                 UpdateTray(status);
                 if (showBalloon)
@@ -364,7 +398,18 @@ namespace CodexQuotaTray
             catch (Exception ex)
             {
                 var status = StatusSnapshot.Error("程序异常：" + ex.Message);
+                if (!includeCalls)
+                {
+                    PreserveCallData(status, _lastStatus);
+                }
+
+                if (!includeQuota)
+                {
+                    PreserveQuotaData(status, _lastStatus);
+                }
+
                 ApplyUsageState(status);
+                ScheduleNextStatusRefresh(status, includeCalls, includeQuota);
                 _lastStatus = status;
                 UpdateTray(status);
                 if (showBalloon)
@@ -375,6 +420,69 @@ namespace CodexQuotaTray
             finally
             {
                 _refreshing = false;
+            }
+        }
+
+        private void ScheduleNextStatusRefresh(StatusSnapshot status, bool includedCalls, bool includedQuota)
+        {
+            var now = DateTime.Now;
+            if (includedCalls)
+            {
+                var currentTotal = status == null ? null : status.CallTotal;
+                var callsChanged = !currentTotal.HasValue ||
+                    !_lastObservedCallTotal.HasValue ||
+                    currentTotal.Value != _lastObservedCallTotal.Value;
+
+                if (currentTotal.HasValue)
+                {
+                    _lastObservedCallTotal = currentTotal.Value;
+                }
+
+                var callsSeconds = callsChanged ? _config.RefreshSeconds : _config.CallsIdleRefreshSeconds;
+                _nextCallsRefresh = now.AddSeconds(Math.Max(5, callsSeconds));
+            }
+
+            if (includedQuota)
+            {
+                _nextQuotaRefresh = now.AddSeconds(Math.Max(60, _config.QuotaRefreshSeconds));
+            }
+        }
+
+        private static void PreserveCallData(StatusSnapshot target, StatusSnapshot previous)
+        {
+            if (target == null || previous == null)
+            {
+                return;
+            }
+
+            target.CallSuccess = previous.CallSuccess;
+            target.CallFailed = previous.CallFailed;
+        }
+
+        private static void PreserveQuotaData(StatusSnapshot target, StatusSnapshot previous)
+        {
+            if (target == null || previous == null)
+            {
+                return;
+            }
+
+            if (!target.Quota5hRemaining.HasValue)
+            {
+                target.Quota5hRemaining = previous.Quota5hRemaining;
+                target.Quota5hAccountCount = previous.Quota5hAccountCount;
+                target.Quota5hReset = previous.Quota5hReset;
+            }
+
+            if (!target.Quota7dRemaining.HasValue)
+            {
+                target.Quota7dRemaining = previous.Quota7dRemaining;
+                target.Quota7dAccountCount = previous.Quota7dAccountCount;
+                target.Quota7dReset = previous.Quota7dReset;
+            }
+
+            if (string.IsNullOrWhiteSpace(target.RawSummary))
+            {
+                target.RawSummary = previous.RawSummary;
             }
         }
 
@@ -409,6 +517,7 @@ namespace CodexQuotaTray
                 {
                     _usageState.Add(delta);
                     _usageState.Save(_usageStatePath);
+                    WakeCallsRefreshFromUsageActivity();
                     if (_lastStatus != null)
                     {
                         ApplyUsageState(_lastStatus);
@@ -422,6 +531,16 @@ namespace CodexQuotaTray
             finally
             {
                 _drainingUsage = false;
+            }
+        }
+
+        private void WakeCallsRefreshFromUsageActivity()
+        {
+            var activeSeconds = Math.Max(5, Math.Min(_config.RefreshSeconds, 60));
+            var nextActiveCheck = DateTime.Now.AddSeconds(activeSeconds);
+            if (_nextCallsRefresh == DateTime.MinValue || nextActiveCheck < _nextCallsRefresh)
+            {
+                _nextCallsRefresh = nextActiveCheck;
             }
         }
 
@@ -442,7 +561,7 @@ namespace CodexQuotaTray
         {
             if (_lastStatus == null)
             {
-                _ = RefreshStatusAsync(true);
+                _ = RefreshStatusAsync(true, true);
                 return;
             }
 
@@ -553,6 +672,8 @@ namespace CodexQuotaTray
         public string ManagementPath { get; set; }
         public string ProviderMode { get; set; }
         public int RefreshSeconds { get; set; }
+        public int CallsIdleRefreshSeconds { get; set; }
+        public int QuotaRefreshSeconds { get; set; }
         public bool ShowTaskbarWidget { get; set; }
         public string ManagementKeyEnvironmentVariable { get; set; }
         public string ApiKeyEnvironmentVariable { get; set; }
@@ -621,6 +742,16 @@ namespace CodexQuotaTray
                 RefreshSeconds = 60;
             }
 
+            if (CallsIdleRefreshSeconds < RefreshSeconds)
+            {
+                CallsIdleRefreshSeconds = Math.Max(600, RefreshSeconds);
+            }
+
+            if (QuotaRefreshSeconds < 60)
+            {
+                QuotaRefreshSeconds = 180;
+            }
+
             if (ManagementKeyEnvironmentVariable == null)
             {
                 ManagementKeyEnvironmentVariable = "CPAMC_MANAGEMENT_KEY";
@@ -640,6 +771,8 @@ namespace CodexQuotaTray
                 ManagementPath = "/management.html",
                 ProviderMode = "cpamc",
                 RefreshSeconds = 60,
+                CallsIdleRefreshSeconds = 600,
+                QuotaRefreshSeconds = 180,
                 ShowTaskbarWidget = true,
                 ManagementKeyEnvironmentVariable = "CPAMC_MANAGEMENT_KEY",
                 ApiKeyEnvironmentVariable = "",
@@ -669,6 +802,11 @@ namespace CodexQuotaTray
                 "  \"_ProviderMode\": \"cpamc is tested. newapi/sub2api are reserved for later testing and currently use generic StatusPaths only.\",\r\n" +
                 "\r\n" +
                 "  \"RefreshSeconds\": 60,\r\n" +
+                "  \"_RefreshSeconds\": \"Calls active refresh interval. If calls changed, check again after this many seconds.\",\r\n" +
+                "  \"CallsIdleRefreshSeconds\": 600,\r\n" +
+                "  \"_CallsIdleRefreshSeconds\": \"If total calls did not change, extend calls refresh to this interval.\",\r\n" +
+                "  \"QuotaRefreshSeconds\": 180,\r\n" +
+                "  \"_QuotaRefreshSeconds\": \"Codex account quota refresh interval. This controls wham/usage calls.\",\r\n" +
                 "  \"ShowTaskbarWidget\": true,\r\n" +
                 "  \"ManagementKeyEnvironmentVariable\": \"CPAMC_MANAGEMENT_KEY\",\r\n" +
                 "  \"ApiKeyEnvironmentVariable\": \"\",\r\n" +
@@ -689,16 +827,21 @@ namespace CodexQuotaTray
 
     internal static class StatusClient
     {
-        public static async Task<StatusSnapshot> FetchAsync(Config config)
+        public static async Task<StatusSnapshot> FetchAsync(Config config, bool includeCalls, bool includeQuota)
         {
             if (string.Equals(config.ProviderMode, "cpamc", StringComparison.OrdinalIgnoreCase) ||
                 string.Equals(config.ProviderMode, "auto", StringComparison.OrdinalIgnoreCase))
             {
-                var cpamcStatus = await CpamcClient.TryFetchAsync(config);
+                var cpamcStatus = await CpamcClient.TryFetchAsync(config, includeCalls, includeQuota);
                 if (cpamcStatus != null)
                 {
                     return cpamcStatus;
                 }
+            }
+
+            if (!includeCalls)
+            {
+                return StatusSnapshot.Error("No generic quota endpoint configured");
             }
 
             var apiKey = GetApiKey(config.ApiKeyEnvironmentVariable);
@@ -1021,8 +1164,13 @@ namespace CodexQuotaTray
             return delta;
         }
 
-        public static async Task<StatusSnapshot> TryFetchAsync(Config config)
+        public static async Task<StatusSnapshot> TryFetchAsync(Config config, bool includeCalls, bool includeQuota)
         {
+            if (!includeCalls && !includeQuota)
+            {
+                return null;
+            }
+
             if (!string.Equals(config.ProviderMode, "cpamc", StringComparison.OrdinalIgnoreCase) &&
                 !string.Equals(config.ProviderMode, "auto", StringComparison.OrdinalIgnoreCase))
             {
@@ -1047,48 +1195,57 @@ namespace CodexQuotaTray
             var codexFiles = new List<AuthFileInfo>();
             var hasAuthFiles = false;
 
-            try
+            if (includeCalls)
             {
-                usage = await FetchUsageTotalsAsync(config, managementKey);
-                hasUsage = true;
-            }
-            catch (Exception ex)
-            {
-                errors.Add("api-key-usage: " + CleanMessage(ex.Message));
-            }
-
-            try
-            {
-                var logUsage = await FetchRequestLogUsageAsync(config, managementKey);
-                if (logUsage.Total > usage.Total)
+                try
                 {
-                    usage = logUsage;
+                    usage = await FetchUsageTotalsAsync(config, managementKey);
                     hasUsage = true;
                 }
-            }
-            catch (Exception ex)
-            {
-                errors.Add("logs: " + CleanMessage(ex.Message));
-            }
-
-            try
-            {
-                codexFiles = await FetchCodexAuthFilesAsync(config, managementKey);
-                hasAuthFiles = true;
-                var authUsage = SumAuthFileUsage(codexFiles);
-                if (usage.Total == 0 && authUsage.Total > 0)
+                catch (Exception ex)
                 {
-                    usage = authUsage;
-                    hasUsage = true;
+                    errors.Add("api-key-usage: " + CleanMessage(ex.Message));
                 }
             }
-            catch (Exception ex)
+
+            if (includeCalls)
             {
-                errors.Add("auth-files: " + CleanMessage(ex.Message));
+                try
+                {
+                    var logUsage = await FetchRequestLogUsageAsync(config, managementKey);
+                    if (logUsage.Total > usage.Total)
+                    {
+                        usage = logUsage;
+                        hasUsage = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add("logs: " + CleanMessage(ex.Message));
+                }
+            }
+
+            if (includeQuota || (includeCalls && usage.Total == 0))
+            {
+                try
+                {
+                    codexFiles = await FetchCodexAuthFilesAsync(config, managementKey);
+                    hasAuthFiles = true;
+                    var authUsage = SumAuthFileUsage(codexFiles);
+                    if (usage.Total == 0 && authUsage.Total > 0)
+                    {
+                        usage = authUsage;
+                        hasUsage = true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add("auth-files: " + CleanMessage(ex.Message));
+                }
             }
 
             var quotas = new List<CodexQuotaResult>();
-            if (hasAuthFiles)
+            if (includeQuota && hasAuthFiles)
             {
                 foreach (var file in codexFiles)
                 {
@@ -1108,9 +1265,14 @@ namespace CodexQuotaTray
                 }
             }
 
-            if (!hasUsage && !hasAuthFiles)
+            if (includeCalls && !hasUsage && !hasAuthFiles)
             {
                 return StatusSnapshot.Error(errors.Count > 0 ? string.Join("; ", errors.ToArray()) : "CPAMC management API unavailable");
+            }
+
+            if (includeQuota && !hasAuthFiles)
+            {
+                return StatusSnapshot.Error(errors.Count > 0 ? string.Join("; ", errors.ToArray()) : "CPAMC auth files unavailable");
             }
 
             return BuildSnapshot(usage, hasUsage, codexFiles.Count, quotas, errors);

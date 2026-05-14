@@ -54,6 +54,26 @@ JSON 不支持真正注释，所以配置里 `_` 开头字段是备注，程序�
 
 设置后右键托盘图标点“重新加载配置”，或重启程序。
 
+## 刷新策略
+
+状态条的显示、CPA 调用统计、token 累计和 Codex 额度查询是分开的。
+
+- 窗口 keepalive：每 3 秒只维护任务栏状态条的窗口层级，不请求 CPA，也不请求 Codex 账号接口。
+- Token 累计：每 10 秒读取一次 CPA `/v0/management/usage-queue`，只访问局域网 CPA，不直接访问 Codex 账号。
+- Calls 活跃刷新：`RefreshSeconds` 控制，默认 60 秒。这个刷新只查 CPA 的 calls/logs，不请求 `wham/usage`。
+- Calls 空闲刷新：如果一次 Calls 检查发现总次数没有变化，下一次 Calls 检查延长到 `CallsIdleRefreshSeconds`，默认 600 秒。
+- Calls 活动唤醒：如果 Calls 已进入 600 秒空闲档，但 `usage-queue` 在 10 秒轮询中发现新 token 记录，会把下一次 Calls 检查提前到活跃间隔内，默认 60 秒内。
+- Codex 额度刷新：`QuotaRefreshSeconds` 控制，默认 180 秒。只有这个刷新会通过 CPA 调用每个 Codex auth 的 `wham/usage`。
+- 手动刷新：右键“立即刷新”或鼠标中键托盘图标会同时刷新 Calls 和 Codex 额度。
+
+边界例子：
+
+- 00:00 完整刷新，Calls 和额度都刷新。
+- 03:00 额度到期，只刷新 `5h` / `7d` 额度；如果此时刚好也到了 Calls 检查，且 Calls 没变化，Calls 会进入 600 秒空闲档。
+- 04:00 发生新的 Codex 调用，程序本身无法凭空知道远端 calls 已变化，但 10 秒 token 队列轮询通常会读到新 token 记录。
+- 读到 token 活动后，会把下一次 Calls 检查提前到活跃间隔内，默认大约 05:00 检查，而不是继续等原来的 10 分钟空闲档。
+- 如果这次调用没有进入 `usage-queue`，程序就没有活动信号，只能等下一次已安排的 Calls 检查。
+
 ## 额度说明
 
 任务栏上 `F1` 表示失败请求 1 次。`92% x3` 表示该窗口账号池综合剩余额度为 92%，纳入统计的账号数为 3。
