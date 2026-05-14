@@ -145,7 +145,7 @@ namespace CodexQuotaTray
             }
 
             _widgetRecoveryTimer = new System.Windows.Forms.Timer();
-            _widgetRecoveryTimer.Interval = 30000;
+            _widgetRecoveryTimer.Interval = 3000;
             _widgetRecoveryTimer.Tick += (s, e) => _widget.EnsureVisibleLight(_widgetItem.Checked);
             _widgetRecoveryTimer.Start();
 
@@ -2856,11 +2856,13 @@ namespace CodexQuotaTray
             {
                 ApplyInitialPosition();
                 Show();
+                reassertTopMost = true;
             }
 
             if (WindowState == FormWindowState.Minimized)
             {
                 WindowState = FormWindowState.Normal;
+                reassertTopMost = true;
             }
 
             KeepTransparentBackground();
@@ -2879,6 +2881,17 @@ namespace CodexQuotaTray
                     0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200);
                 Invalidate(true);
                 Update();
+            }
+            else
+            {
+                SetWindowPos(
+                    Handle,
+                    new IntPtr(-1),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200);
             }
         }
 
